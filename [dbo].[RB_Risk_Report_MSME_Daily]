@@ -1,0 +1,286 @@
+USE [RiskDB]
+GO
+/****** Object:  StoredProcedure [dbo].[RB_Risk_Report_MSME_Daily]    Script Date: 4/8/2025 11:12:33 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+ALTER   PROCEDURE	
+--exec 
+[dbo].[RB_Risk_Report_MSME_Daily]
+AS
+BEGIN
+
+ --=============================================
+ --Procedure: Riskdb.dbo.RB_Risk_Report_MSME_Daily
+ --Created By: Nikoloz Nadashvili
+ --Created Date: 2025/04/08
+ --Last Script Update Date: 2025/04/08
+ --Description: Эта процедура создана что бы создавать таблицы,которые привязанны к билдеру для дневного репорта Risk Report MSME Daily
+ --процедура работает в среднем за 1 минуту,она стоит на автоматическом обновлении утром приблезительно к 6 утра
+ --скрипт сам удаляет таблицы и создает новые каждый день,что бы следующий день запись данные.
+ --так же он привязан к таблице которая тоже стоит на джобе процедуры,которая создает таблицу
+ --Из репорт билдера на почту отправляется получателям группы MSME_Risk_Metrics_Digest в 9:00 по Грузинскому времени
+  --=============================================
+ 
+DECLARE @RunID INT;
+DECLARE @StartTime DATETIME = GETDATE();
+DECLARE @UserLogin NVARCHAR(128) = SYSTEM_USER;
+INSERT INTO RiskDB.system.TableUpdateLog (ProcedureName, TableName, StartTime, Status, LogDate, Login)
+VALUES ('MSME_Daily_Check', 'Daily Tables MSME', @StartTime, 'In Progress', CAST(GETDATE() AS DATE), @UserLogin);
+SET @RunID = SCOPE_IDENTITY();
+
+DECLARE @l10d DATE  = DATEADD(DAY, -31, CAST(GETDATE() AS DATE));
+DECLARE @today DATE  = GETDATE() 
+DECLARE @yesterday DATE  = DATEADD(DAY,-1,@today)
+
+DECLARE @Decade_1_start date  = DATEADD(DAY,-20,@yesterday)
+DECLARE @Decade_1_end  date  = DATEADD(DAY,-10,@yesterday)
+DECLARE @Decade_2_start date  = DATEADD(DAY,-30,@yesterday)
+DECLARE @Decade_2_end DATE  = DATEADD(DAY,-19,@yesterday)
+
+
+
+
+
+
+DROP TABLE IF EXISTS #Calendar;
+CREATE TABLE #Calendar ( Period_in_Days DATE);
+DECLARE @currentDate DATE = @l10d;
+WHILE @currentDate < @today
+BEGIN
+    INSERT INTO #Calendar (Period_in_Days)
+    VALUES (@currentDate);    
+    SET @currentDate = DATEADD(DAY, 1, @currentDate);
+END;
+
+-- Общая таблица аппов
+DROP TABLE IF EXISTS #MSME_Apps
+ SELECT  a.ID_Pers
+       , a.ID_A
+       , a.ID_D
+       , a.fn_today
+       , a.fn_final_result
+       , a.Disbursed
+       , a.Disbursed_Amount
+       , a.wof_date -- берется из воф таблицы марьям так что окей
+       , a.[6m_status]
+	   , a.Lit_date
+	   , [decade] = CASE WHEN a.fn_today BETWEEN @Decade_1_start AND @Decade_1_end THEN 'Decade_1'
+						 WHEN a.fn_today BETWEEN @Decade_2_start AND @Decade_2_end THEN 'Decade_2'
+						 ELSE 'Not_in_Decade'
+					END 
+ INTO #MSME_Apps
+ FROM RiskDB.dbo.MSME_Apps AS a WITH(NOLOCK)
+ WHERE a.fn_today < @today
+  
+
+DROP TABLE IF EXISTS  #Wair_Disbursed
+ SELECT	 v2.disbursement_date
+		,[WAIR_of_disbursements] = SUM ( v2.disbursement_amount * v2.perc_rate/100 ) / SUM ( v2.disbursement_amount ) 
+INTO #Wair_Disbursed 
+FROM db.uzdwh.loan_portfolio_agg_merge AS v2 	 WITH (NOLOCK)
+LEFT JOIN #MSME_Apps AS app WITH(NOLOCK) ON app.ID_D = CAST(v2.loan_id AS VARCHAR(20))
+ WHERE v2.loan_type = 'MSME' 
+ AND v2.disbursement_date >= @l10d
+ GROUP BY v2.disbursement_date
+ 
+ 
+ --Дейли аппы по разбивке тотал,статусу клиента и декаде
+ DELETE FROM riskdb.ReportBuilder.[MSME_Application_and_Segment_Block_full] WHERE Period_in_days >= @l10d
+ INSERT INTO riskdb.ReportBuilder.[MSME_Application_and_Segment_Block_full]
+  SELECT 
+		[Period_in_Days]		= s.fn_today,
+		[Decade]				= s.decade,
+		[App_Numbers_Qty]		= ISNULL(COUNT(s.ID_A),0),
+		[Approval_rate]			= ISNULL(SUM(s.fn_final_result)*1.0/NULLIF(COUNT(s.ID_A),0),0) ,
+		[Net_Take_Up_rate]	    = ISNULL(SUM(s.Disbursed)*1.0/NULLIF(COUNT(s.ID_A),0),0),
+		[Take_up_Percent_Qty]	= ISNULL(SUM(s.Disbursed) * 1.0/ NULLIF(SUM(s.fn_final_result),0),0),
+		[Disb_numbers_Qty]		= ISNULL(SUM(s.Disbursed),0),
+		[Disb_amount_M_UZS]		= ISNULL(SUM(s.Disbursed_Amount),0),
+		[Avg_ticket_size_UZS]	= ISNULL(SUM(s.Disbursed_Amount) / NULLIF(SUM(s.Disbursed),0),0),
+		[Wair]					= ISNULL(MIN(w.WAIR_of_disbursements),0),
+		[Table_Type]			= IIF(GROUPING(s.[6m_status])=1 , 'Overall' , s.[6m_status])
+ FROM #MSME_Apps AS s 
+ LEFT JOIN #Wair_Disbursed AS w ON w.disbursement_date = s.fn_today
+ GROUP BY GROUPING SETS ((s.fn_today),(s.fn_today,s.[6m_status]),(s.decade),(s.decade,s.[6m_status]))
+ HAVING s.[6m_status] IN ('NEW','<=2m','>2m') OR GROUPING(s.[6m_status])=1 ;
+
+
+ --Дальше по портфелю
+  
+ DROP TABLE IF EXISTS  #WOF
+  SELECT  w.Loan_id,MIN(w.Wof_Date) AS WOF_date
+  INTO #WOF
+  FROM riskdb.dbo.Db_AllWriteoff_date_MP AS w
+  WHERE w.Wof_Date >= @l10d AND w.Product ='MSME' AND w.WoF_type ='Principal'
+  GROUP BY w.Loan_id
+    
+
+
+
+ DROP TABLE IF EXISTS #vwLoanSnapshots
+  SELECT 
+		-- [ActivationDate]= v2.disbursement_date
+		[AссountId] = CAST(v2.loan_id AS VARCHAR(15))
+		--,[ClosedDate] = v2.fact_close_date
+		,[CalculationDate] = v2.calc_day
+		,[PrincipalBalance] = v2.total_principal 
+		,[OverdueDays] = IIF( v2.calc_day <= '20241231' , isnull(v2.overdue_days, 0) , isnull(v2.overdue_days_fd, 0))
+		,[amount] = v2.disbursement_amount 
+		,[6m_status] = [MSME].[6m_status]		
+		,[Wof_Flag] = ISNULL(IIF(v2.calc_day >= w.WOF_date,1,0),0) 
+		--,[Lit_flag] = ISNULL(IIF(v2.calc_day >= MSME.Lit_date,1,0),0)
+		,[Princ_overd] =  (v2.overdue_principal + v2.current_principal)
+		,[perc_rate] = v2.perc_rate/100
+		,[Decade] = CASE WHEN v2.calc_day = @Decade_1_end THEN 'Decade_1'
+						WHEN v2.calc_day = @Decade_2_end THEN 'Decade_2'
+						ELSE 'Not_in_dacade'
+				   END 
+  INTO #vwLoanSnapshots
+  FROM db.uzdwh.loan_portfolio_agg AS v2 	 WITH(NOLOCK)
+  LEFT JOIN #MSME_Apps AS MSME ON MSME.ID_D = v2.loan_id
+  LEFT JOIN #WOF AS w ON w.Loan_id = CAST(v2.loan_id AS VARCHAR(40))
+  WHERE v2.loan_type = 'MSME' 
+		AND v2.calc_day >= @l10d
+		
+
+
+
+ DROP TABLE IF EXISTS #WAIR_Portf
+  SELECT  v2.CalculationDate
+		 , [WAIR] =  SUM ( IIF( v2.[Princ_overd] > 0, v2.[Princ_overd] * v2.Perc_rate, NULL)) / NULLIF ( SUM ( IIF(v2.[Princ_overd] > 0, v2.[Princ_overd], NULL)) , 0 )
+		  INTO #WAIR_Portf
+  FROM #vwLoanSnapshots AS v2
+  GROUP by  v2.CalculationDate
+
+
+
+  DELETE FROM  riskdb.ReportBuilder.MSME_Portfolio_Block_full WHERE [Date] >= @l10d
+INSERT INTO riskdb.ReportBuilder.MSME_Portfolio_Block_full
+SELECT
+    [Date] = v2.CalculationDate
+  , [Decade] = v2.Decade
+  , [Overall portfolio, #] = COUNT ( v2.AссountId )
+  , [Overal portfolio, UZS] = ISNULL ( SUM ( v2.PrincipalBalance ) / 1000000, 0 )
+  , [PAR ALL] = ISNULL ( SUM ( CASE WHEN v2.OverdueDays > 0 THEN v2.PrincipalBalance ELSE 0 END ) / 1000000 / NULLIF ( SUM ( v2.PrincipalBalance ) / 1000000, 0 ) , 0 )
+  , [PAR 30] = ISNULL ( SUM ( CASE WHEN v2.OverdueDays > 30 THEN v2.PrincipalBalance ELSE 0 END ) / 1000000 / NULLIF ( SUM ( v2.PrincipalBalance ) / 1000000, 0 ) , 0 )
+  , [PAR 90] = ISNULL ( SUM ( CASE WHEN v2.OverdueDays > 90 THEN v2.PrincipalBalance ELSE 0 END ) / 1000000 / NULLIF ( SUM ( v2.PrincipalBalance ) / 1000000, 0 )  , 0 )
+  , [Category] = CASE WHEN GROUPING ( v2.[6m_status] ) = 1 THEN 'Overall' ELSE v2.[6m_status] END
+  , [Wof_Flag] = v2.Wof_Flag
+  , [Wair] = MIN(w.WAIR)
+  , [TableType] = 'PortfolioBlock'
+FROM    #vwLoanSnapshots v2
+LEFT JOIN #WAIR_Portf AS w ON w.CalculationDate = v2.CalculationDate AND v2.Wof_Flag = 0  --WOF flag -0 shto bi privyazaw 1 raz
+GROUP BY GROUPING SETS((v2.CalculationDate, v2.Wof_Flag), (v2.CalculationDate, v2.Wof_Flag, v2.[6m_status]),(v2.Decade, v2.Wof_Flag), (v2.Decade, v2.Wof_Flag, v2.[6m_status]))
+HAVING  GROUPING ( v2.[6m_status] ) = 1 OR  v2.[6m_status] IN ( 'NEW', '<=2m', '>2m' );
+
+
+
+-----------Repayments Block
+
+DROP TABLE IF EXISTS  #LoansRepayment
+SELECT a.Period_in_Days AS Disbursement_Date,
+	   a.Disb_amount_M_UZS AS [Disbursements_Total]
+INTO #LoansRepayment
+FROM riskdb.ReportBuilder.MSME_Application_and_Segment_Block_full  AS a 
+WHERE a.Table_Type ='Overall' AND a.Period_in_Days >= @l10d
+	 	 	
+
+---**--- тут мы создаем еще одну строчку с тоталом
+	DROP TABLE IF EXISTS  #Loan_Payments_new
+	SELECT
+	 lpn.loan_id,
+	 CAST(lpn.transaction_time AS DATE) AS repayment_date,
+	 IIF(GROUPING(lpn.payment_type) = 1 , 'total', lpn.payment_type) AS payment_type,
+	 SUM(lpn.payment_sum) AS total_payment_sum
+	INTO #Loan_Payments_new
+	FROM		db.uzdwh.v_loan_payments_all AS lpn WITH(NOLOCK)
+	WHERE       loan_type = 'MSME' AND CAST(lpn.transaction_time AS DATE) >= @l10d
+				AND CAST(lpn.transaction_time AS DATE)  != CAST(GETDATE() AS DATE)
+				AND ISNULL(is_add_loan, 0) != 1
+				AND ISNULL(prob_offbalance_storno, 0) != 1
+				AND  ISNULL(is_client_payment,0) != 2
+	GROUP BY GROUPING SETS ((loan_id, CAST(lpn.transaction_time AS DATE), lpn.payment_type),  -- группировка по типу платежа
+							 (loan_id, CAST(lpn.transaction_time AS DATE)))                      -- итоговая строка (без payment_type)
+	
+
+---**--- тут мы переносим строчки в колонки
+DROP TABLE IF EXISTS #Payments_list
+  SELECT 
+   [Loan_id] =    lp.loan_id
+  ,[repayment_date] = lp.repayment_date 
+  ,[principal] = ISNULL(lp.principal,0)
+  ,[offbalance_principal] = ISNULL(lp.offbalance_principal,0)
+  ,[overdue_principal] = ISNULL(lp.overdue_principal,0)
+  ,[offbalance_interest] = ISNULL(lp.offbalance_interest,0)
+  ,[fees_due] = ISNULL(lp.fees_due,0)
+  ,[fees_due_new] =ISNULL(lp.fees_due_new,0)
+  ,[litigation_principal] = ISNULL(lp.litigation_principal,0)
+  ,[overdue_interest] = ISNULL(lp.overdue_interest,0)
+  ,[penalty] = ISNULL(lp.penalty,0)
+  ,[interest] = ISNULL(lp.interest,0)
+  ,[Total] = ISNULL(lp.total,0)
+  INTO #Payments_list
+  FROM     #Loan_Payments_new AS lp
+  PIVOT 
+	   (MAX(total_payment_sum) 
+       FOR payment_type IN (principal,offbalance_principal,overdue_principal,offbalance_interest,fees_due,fees_due_new,
+						   litigation_principal,overdue_interest,penalty,interest,total)) AS lp
+
+  
+ 
+   DROP TABLE IF EXISTS #payments
+    SELECT		  lp.repayment_date,
+				  [Repayments_Total] = SUM(lp.Total)/1000000,
+				  [Repayments_Principal] = SUM(lp.principal  + lp.overdue_principal+ lp.litigation_principal +lp.offbalance_principal)/1000000,
+				  [Repayments_Interest] = SUM(lp.interest + lp.overdue_interest +lp.offbalance_interest )/1000000,
+				  [Repayments_Penalty] = SUM(lp.penalty)/1000000,
+				  [Repayments_Fees] = (SUM(lp.fees_due )+SUM(lp.fees_due_new ))/1000000
+			INTO #payments
+    FROM #Payments_list AS lp
+	GROUP BY lp.repayment_date
+
+	 
+
+
+	DELETE FROM riskdb.ReportBuilder.MSME_Repayment_Loans WHERE calc_date >= @l10d
+	INSERT 	 INTO  riskdb.ReportBuilder.MSME_Repayment_Loans --_Full Table
+	 
+SELECT
+    [calc_date] = l.Disbursement_Date,
+    l.Disbursements_Total,
+    p.Repayments_Total,
+    p.Repayments_Principal,
+    p.Repayments_Interest,
+    p.Repayments_Penalty,
+    p.Repayments_Fees,
+    [Cash-in to outflow ratio, %] = p.Repayments_Total / NULLIF(l.Disbursements_Total, 0)
+FROM #LoansRepayment AS l
+LEFT JOIN #payments AS p ON p.repayment_date = l.Disbursement_Date;
+
+
+
+	 --Процедура которая считает Временные отрезки (MTD,PM,PYTD и т.д)
+-- EXEC RiskDB.dbo.[RB_Risk_Report_MSME_Daily_dateframes] --всё ок
+
+DECLARE @EndTime DATETIME = GETDATE();
+DECLARE @DurationSeconds INT = DATEDIFF(SECOND, @StartTime, @EndTime);
+DECLARE @DurationFormatted VARCHAR(8) = CONVERT(VARCHAR(8), DATEADD(SECOND, @DurationSeconds, 0), 108);
+
+UPDATE RiskDB.system.TableUpdateLog
+SET EndTime = @EndTime,
+    Duration = @DurationSeconds,
+    DurationFormatted = @DurationFormatted,
+    Status = 'Updated'
+WHERE RunID = @RunID;
+
+
+
+
+END
+
+
